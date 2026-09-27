@@ -17,7 +17,7 @@ import subprocess
 import sys
 import webbrowser
 
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal, QTimer
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -39,10 +39,12 @@ SHOW_HOTKEY = "ctrl+space"
 
 WINDOW_WIDTH = 640
 INPUT_HEIGHT = 56
-ROW_HEIGHT = 46
+ITEM_H = 58
+VISIBLE_ROWS = 6
 WINDOW_MIN_HEIGHT = 150
 WINDOW_MAX_HEIGHT = 480
-MAX_SUGGESTIONS = 6
+MAX_SUGGESTIONS = 50
+DEFAULT_PLACEHOLDER = "Search keywords or descriptions…  (try: keys, 2+2, add)"
 
 
 # ---------------------------------------------------------------- config ---
@@ -84,6 +86,11 @@ def norm_key(key: str) -> str:
 def display_key(key: str) -> str:
     """User-facing form: First Letter Caps for every word."""
     return re.sub(r"[_.\-]+", " ", (key or "").strip()).title() or "?"
+
+
+def nat_key(s: str):
+    """Natural sort: alphabetical + numerical (item2 < item10)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
 def get_target(entry) -> str:
@@ -273,6 +280,38 @@ def parse_desc_command(text: str):
     return norm_key(m.group(1)), _strip_quotes(m.group(2).strip()), True
 
 
+_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*:.*$")
+_DRIVE_RE = re.compile(r"^[a-zA-Z]:[\\/]")
+
+
+def classify_target(value: str):
+    """Decide how a stored target should be opened.
+
+    Returns (kind, arg) with kind in {"url", "path", "scheme", "app", "shell"}:
+    - url: http(s) link -> default browser
+    - path: existing file/folder -> associated app / explorer
+    - scheme: ms-teams:, mailto:, ... -> OS handler
+    - app: bare app name (chrome, teams, notepad, ...) -> `start` on
+      Windows (resolves App Paths registry + PATH), shell elsewhere
+    - shell: full commands / exe paths with args -> run via shell
+    """
+    v = (value or "").strip().strip("'\"")
+    if not v:
+        return ("empty", v)
+    if v.startswith(("http://", "https://")):
+        return ("url", v)
+    if os.path.exists(v):
+        return ("path", v)
+    if _DRIVE_RE.match(v) or v.startswith("\\\\"):
+        # drive/UNC path that doesn't exist (yet) -> let the shell try
+        return ("shell", v)
+    if _URI_RE.match(v):
+        return ("scheme", v)
+    if re.search(r"[\\/]", v) or v.lower().endswith((".exe", ".bat", ".cmd", ".lnk")):
+        return ("shell", v)
+    return ("app", v)
+
+
 def parse_del_command(text: str):
     m = re.match(r"^(del|delete|rm|remove)\s+(\S+)\s*$", text.strip(), re.IGNORECASE)
     if not m:
@@ -320,9 +359,11 @@ class ModernLauncher(QWidget):
                 padding: 6px;
             }
             QListWidget#Results::item {
-                padding: 10px 12px;
-                margin: 2px;
-                border-radius: 9px;
+                padding: 0px;
+                margin: 2px 4px 2px 2px;
+                border: none;
+                border-radius: 10px;
+                background: transparent;
             }
             QListWidget#Results::item:selected {
                 background: #3a70b8;
@@ -330,6 +371,25 @@ class ModernLauncher(QWidget):
             }
             QListWidget#Results::item:hover:!selected {
                 background: #353548;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 8px;
+                margin: 4px 2px 4px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #4a4a63;
+                border-radius: 4px;
+                min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #5a5a78;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
             }
             """
         )
@@ -360,18 +420,21 @@ class ModernLauncher(QWidget):
 
         self.entry = QLineEdit()
         self.entry.setObjectName("SearchBox")
-        self.entry.setPlaceholderText("Type keyword, math, or `add key value`…")
+        self.entry.setPlaceholderText(DEFAULT_PLACEHOLDER)
         self.entry.setFixedHeight(INPUT_HEIGHT)
         self.entry.setClearButtonEnabled(True)
         self.entry.textChanged.connect(self.on_text_changed)
         self.entry.returnPressed.connect(self.on_enter)
+        self.entry.installEventFilter(self)
         layout.addWidget(self.entry)
 
         self.list_widget = QListWidget()
         self.list_widget.setObjectName("Results")
         self.list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.list_widget.setUniformItemSizes(False)
+        self.list_widget.setUniformItemSizes(True)
         self.list_widget.setSpacing(2)
+        self.list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_widget.itemClicked.connect(self.on_item_clicked)
         self.list_widget.itemActivated.connect(self.on_item_clicked)
         layout.addWidget(self.list_widget)
@@ -380,7 +443,7 @@ class ModernLauncher(QWidget):
 
     # -- config -----------------------------------------------------
     def refresh_keywords(self):
-        self.keywords = sorted(self.config.get("mappings", {}).keys(), key=str.lower)
+        self.keywords = sorted(self.config.get("mappings", {}).keys(), key=nat_key)
 
     def persist(self):
         save_config(self.config)
@@ -436,6 +499,8 @@ class ModernLauncher(QWidget):
         self.config = load_config()
         self.refresh_keywords()
         self.entry.clear()
+        # fresh open: empty box with the default hint, never stale text
+        self.entry.setPlaceholderText(DEFAULT_PLACEHOLDER)
         self.show_suggestions("")
         self.center_window()
         self.show()
@@ -461,15 +526,74 @@ class ModernLauncher(QWidget):
         _ = size
 
     # -- suggestions --------------------------------------------------
-    def _item(self, text: str, sub: str = "", payload: dict | None = None):
-        label = text if not sub else f"{text}  —  {sub}"
-        item = QListWidgetItem(label)
-        item.setToolTip(label)
+    # Display strings live in UserRole+1; the item text itself stays EMPTY.
+    # (If the item holds text, Qt's delegate paints it underneath our custom
+    # widget and every row renders twice — the "double fonts" bug.)
+    TEXT_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def _item(self, title: str, sub: str = "", payload: dict | None = None):
+        item = QListWidgetItem()
+        item.setToolTip(f"{title}\n{sub}" if sub else title)
         item.setData(Qt.ItemDataRole.UserRole, payload or {})
+        item.setData(self.TEXT_ROLE, (title, sub))
+        item.setSizeHint(QSize(0, ITEM_H))
         return item
 
+    def _render_rows(self):
+        """Paint every row as title-over-description: bold key on top,
+        smaller dimmer description below. No separator characters.
+        In the manager view each stored keyword also gets a delete button,
+        so keys can be added, edited AND deleted without leaving the popup."""
+        for r in range(self.list_widget.count()):
+            item = self.list_widget.item(r)
+            stored = item.data(self.TEXT_ROLE) or ("", "")
+            title, sub = stored[0], (stored[1] if len(stored) > 1 else "")
+            data = item.data(Qt.ItemDataRole.UserRole) or {}
+            is_hint = data.get("kind") == "hint"
+
+            wrap = QFrame()
+            wrap.setStyleSheet("QFrame { background: transparent; border: none; }")
+            row = QHBoxLayout(wrap)
+            row.setContentsMargins(12, 7, 6, 7)
+            row.setSpacing(8)
+
+            text_col = QVBoxLayout()
+            text_col.setContentsMargins(0, 0, 0, 0)
+            text_col.setSpacing(1)
+            t = QLabel(title)
+            if is_hint:
+                t.setStyleSheet("color: #c9c9d6; font-size: 13px; background: transparent; border: none;")
+            else:
+                t.setStyleSheet("color: #f2f2f7; font-size: 14px; font-weight: 700;"
+                                " background: transparent; border: none;")
+            text_col.addWidget(t)
+            if sub:
+                d = QLabel(sub)
+                d.setStyleSheet("color: #9a9ab0; font-size: 12px;"
+                                " background: transparent; border: none;")
+                text_col.addWidget(d)
+            text_col.addStretch(1)
+            row.addLayout(text_col, 1)
+
+            key = data.get("key", "")
+            if (data.get("kind") == "launch"
+                    and key in self.config.get("mappings", {})):
+                del_btn = QPushButton("\u2715")
+                del_btn.setToolTip(f"Delete {display_key(key)}")
+                del_btn.setFixedSize(28, 28)
+                del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                del_btn.setStyleSheet(
+                    "QPushButton { color: #6b6b85; font-size: 13px; font-weight: 700;"
+                    " background: transparent; border: none; border-radius: 8px; min-width: 0px; }"
+                    "QPushButton:hover { color: #ff7b72; background: #3a2a35; }"
+                )
+                del_btn.clicked.connect(lambda _=False, k=key: self.delete_mapping(k))
+                row.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+            self.list_widget.setItemWidget(item, wrap)
+
     def _key_row(self, key: str):
-        """One row for a stored keyword: Title Case + description (never the raw value)."""
+        """One row for a stored keyword: bold Title Case + dim description."""
         entry = self.config.get("mappings", {}).get(key, {})
         desc = get_desc(entry).strip()
         sub = desc if desc else "No description yet"
@@ -492,14 +616,8 @@ class ModernLauncher(QWidget):
                                {"kind": "hint"})
                 )
             else:
-                for k in sorted(maps, key=str.lower)[:MAX_SUGGESTIONS]:
+                for k in sorted(maps, key=nat_key)[:MAX_SUGGESTIONS]:
                     self.list_widget.addItem(self._key_row(k))
-                if len(maps) > MAX_SUGGESTIONS:
-                    self.list_widget.addItem(
-                        self._item(f"+{len(maps) - MAX_SUGGESTIONS} more…",
-                                   "keep typing to filter, click a row to edit",
-                                   {"kind": "hint"})
-                    )
             self._after_list()
             return
 
@@ -518,8 +636,8 @@ class ModernLauncher(QWidget):
                 )
             else:
                 self.list_widget.addItem(
-                    self._item("Usage  —  add <keyword> <url-or-path> | description",
-                               "example: add docs D:\\docs | Project docs",
+                    self._item("Add a keyword",
+                               "add <keyword> <url, path, or app> | description",
                                {"kind": "hint"})
                 )
             self._after_list()
@@ -542,8 +660,8 @@ class ModernLauncher(QWidget):
                 )
             else:
                 self.list_widget.addItem(
-                    self._item("Usage  —  edit <keyword>",
-                               "loads it back into the box for editing",
+                    self._item("Edit a keyword",
+                               "edit <keyword> loads it back into the box",
                                {"kind": "hint"})
                 )
             self._after_list()
@@ -566,8 +684,8 @@ class ModernLauncher(QWidget):
                     )
             else:
                 self.list_widget.addItem(
-                    self._item("Usage  —  desc <keyword> <text>",
-                               "example: desc docs Project documentation",
+                    self._item("Describe a keyword",
+                               "desc <keyword> <text>",
                                {"kind": "hint"})
                 )
             self._after_list()
@@ -591,30 +709,33 @@ class ModernLauncher(QWidget):
                     )
             else:
                 self.list_widget.addItem(
-                    self._item("Usage  —  del <keyword>", "", {"kind": "hint"})
+                    self._item("Delete a keyword", "del <keyword>", {"kind": "hint"})
                 )
             self._after_list()
             return
 
-        # empty query: top keywords + discoverable helpers
+        # empty query: stored keywords, if any, plus the built-ins —
+        # Manage Keys and Prettycode — always visible.
         if not raw:
-            for k in sorted(maps, key=str.lower)[:MAX_SUGGESTIONS]:
+            for k in sorted(maps, key=nat_key)[:MAX_SUGGESTIONS]:
                 self.list_widget.addItem(self._key_row(k))
-            # pad so the popup never collapses to nothing
-            helpers = [
-                ("Prettycode", "Paste code, get it prettified",
-                 {"kind": "launch", "key": "prettycode"}),
-                ("Keys", "Manage all keywords",
-                 {"kind": "manage"}),
-            ]
-            for t, s, p in helpers:
-                if self.list_widget.count() < MAX_SUGGESTIONS:
-                    self.list_widget.addItem(self._item(t, s, p))
+            if self.list_widget.count() < MAX_SUGGESTIONS:
+                self.list_widget.addItem(
+                    self._item("Manage Keys", "Add, edit, delete keywords",
+                               {"kind": "manage"}))
+            if self.list_widget.count() < MAX_SUGGESTIONS:
+                self.list_widget.addItem(
+                    self._item("Prettycode", "Paste code, get it prettified",
+                               {"kind": "launch", "key": "prettycode"}))
             self._after_list()
             return
 
-        # filtered keyword matches (logic stays lowercase)
-        for k in [k for k in self.keywords if low in k][:MAX_SUGGESTIONS]:
+        # filtered matches: search keys AND descriptions (logic stays lowercase)
+        for k in sorted(
+            (k for k in self.keywords
+             if low in k or low in get_desc(maps.get(k, {})).lower()),
+            key=nat_key,
+        )[:MAX_SUGGESTIONS]:
             if k in maps:
                 self.list_widget.addItem(self._key_row(k))
 
@@ -639,36 +760,29 @@ class ModernLauncher(QWidget):
         if self.list_widget.count() == 0:
             self.list_widget.addItem(
                 self._item(f"No match for '{raw}'",
-                           f"type:  add {raw.lower()} <url-or-path>",
+                           f"type:  add {raw.lower()} <url, path, or app>",
                            {"kind": "hint"})
             )
 
         self._after_list()
 
     def _after_list(self):
+        self._render_rows()
         if self.list_widget.count():
             self.list_widget.setCurrentRow(0)
+            self.list_widget.scrollToTop()
         self.resize_to_fit()
 
     def resize_to_fit(self):
-        # Stable popup: fixed width, height derived from rows with sane
-        # minimum so it never shrinks "beyond the height of the text".
+        # Stable popup: fixed width; list shows at most VISIBLE_ROWS rows
+        # and scrolls beyond that. Never shrinks below the minimum height.
         count = self.list_widget.count()
-        rows = min(max(count, 1), MAX_SUGGESTIONS)
-        # measure one row; fall back to ROW_HEIGHT constant
-        row_h = ROW_HEIGHT
-        try:
-            if count:
-                h = self.list_widget.sizeHintForIndex(
-                    self.list_widget.model().index(0, 0)).height()
-                if h and 20 <= h <= 80:
-                    row_h = h
-        except Exception:
-            pass
-        list_h = rows * (row_h + 4) + 16
+        visible = min(max(count, 1), VISIBLE_ROWS)
+        list_h = visible * (ITEM_H + 2) + 14
         total = 14 + INPUT_HEIGHT + 10 + list_h + 14
         total = max(WINDOW_MIN_HEIGHT, min(WINDOW_MAX_HEIGHT, total))
         self.setFixedSize(WINDOW_WIDTH, total)
+        self.list_widget.setFixedHeight(list_h)
 
     # -- events ---------------------------------------------------------
     def on_text_changed(self):
@@ -706,7 +820,8 @@ class ModernLauncher(QWidget):
         # In the manager view, clicking a row loads it for editing
         # instead of launching it.
         if getattr(self, "manage_mode", False) and data.get("kind") == "launch":
-            self.load_edit_form(data.get("key", ""))
+            if data.get("key", "") in self.config.get("mappings", {}):
+                self.load_edit_form(data.get("key", ""))
             return
         self.dispatch(data, self.entry.text().strip())
 
@@ -808,28 +923,34 @@ class ModernLauncher(QWidget):
             self.entry.clear()
             return
         # unknown keyword: stay open and guide toward in-popup add flow
-        self.entry.setPlaceholderText(f"No match — type: add {keyword} <url-or-path>")
+        self.entry.setPlaceholderText(f"No match — type: add {keyword} <url, path, or app>")
         self.show_suggestions(keyword)
 
     def open_target(self, value: str):
         try:
-            v = value.strip().strip("'\"")
-            if v.startswith(("http://", "https://")):
+            kind, v = classify_target(value)
+            if kind == "url":
                 webbrowser.open(v)
-                return
-            if os.path.exists(v):
+            elif kind == "path":
                 if os.name == "nt":
                     os.startfile(v)  # noqa: PGH121
                 else:
                     subprocess.Popen(["xdg-open", v])
-                return
-            # allow `explorer D:\dir` style or bare exe names on PATH
-            try:
+            elif kind == "scheme":
                 if os.name == "nt":
                     os.startfile(v)  # noqa: PGH121
                 else:
+                    subprocess.Popen(["xdg-open", v])
+            elif kind == "app":
+                # Bare app name: `start` resolves App Paths registry
+                # (chrome, msedge, ...) + PATH (notepad, ...).
+                if os.name == "nt":
+                    subprocess.Popen(["cmd", "/c", "start", "", v])
+                else:
                     subprocess.Popen(v, shell=True)
-            except Exception:
+            elif kind == "empty":
+                raise ValueError("empty target")
+            else:  # shell: exe paths with args, `explorer ...`, UNC, ...
                 subprocess.Popen(v, shell=True)
         except Exception as exc:
             self.show_popup()
@@ -921,6 +1042,21 @@ class ModernLauncher(QWidget):
         close_btn.clicked.connect(dlg.accept)
         raw.setPlainText("")
         dlg.exec()
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt naming)
+        # Up/Down moves through the results while the search box keeps focus,
+        # so Enter always runs the highlighted row.
+        if obj is self.entry and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                count = self.list_widget.count()
+                if count:
+                    row = self.list_widget.currentRow()
+                    step = -1 if event.key() == Qt.Key.Key_Up else 1
+                    self.list_widget.setCurrentRow((row + step) % count)
+                    self.list_widget.scrollToItem(
+                        self.list_widget.currentItem())
+                return True
+        return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):  # noqa: N802 (Qt naming)
         if event.key() == Qt.Key.Key_Escape:
