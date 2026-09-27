@@ -17,9 +17,10 @@ import subprocess
 import sys
 import webbrowser
 
-from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -142,33 +143,33 @@ def _merge_sections(data: dict) -> dict:
     return data
 
 
+def _load_file(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def load_config() -> dict:
     path = get_config_path()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                data = _merge_sections(data)
-                save_config(data)  # persist normalized form + backfilled descriptions
-                return data
-        except (OSError, json.JSONDecodeError):
-            pass
-    # migrate from legacy local config.json if present
-    legacy = _legacy_config_path()
-    if os.path.exists(legacy) and os.path.abspath(legacy) != os.path.abspath(path):
-        try:
-            with open(legacy, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                data = _merge_sections(data)
-                save_config(data)
-                return data
-        except (OSError, json.JSONDecodeError):
-            pass
-    cfg = {"mappings": normalize_mappings(DEFAULT_CONFIG["mappings"])}
-    save_config(cfg)
-    return cfg
+    data = _load_file(path) if os.path.exists(path) else None
+    if data is None:
+        # migrate from legacy local config.json if present
+        legacy = _legacy_config_path()
+        if os.path.exists(legacy) and os.path.abspath(legacy) != os.path.abspath(path):
+            data = _load_file(legacy)
+    if data is None:
+        cfg = {"mappings": normalize_mappings(DEFAULT_CONFIG["mappings"])}
+        save_config(cfg)
+        return cfg
+    before = json.dumps(data, sort_keys=True, default=str)
+    data = _merge_sections(data)
+    # only touch the disk when normalization/migration actually changed something
+    if json.dumps(data, sort_keys=True, default=str) != before:
+        save_config(data)
+    return data
 
 
 def save_config(config: dict) -> None:
@@ -519,11 +520,9 @@ class ModernLauncher(QWidget):
         if screen is None:
             return
         geo = screen.availableGeometry()
-        size = self.sizeHint()
         x = geo.x() + (geo.width() - WINDOW_WIDTH) // 2
         y = geo.y() + (geo.height() - self.height()) // 2
         self.move(x, max(geo.y() + 40, y))
-        _ = size
 
     # -- suggestions --------------------------------------------------
     # Display strings live in UserRole+1; the item text itself stays EMPTY.
@@ -748,6 +747,14 @@ class ModernLauncher(QWidget):
                                {"kind": "launch", "key": "prettycode"})
                 )
 
+        # quit/exit (the popup has no chrome: this is the only clean way out,
+        # unless shadowed by a user mapping of the same name)
+        if low in ("quit", "exit") and "quit" not in maps and "exit" not in maps:
+            self.list_widget.insertItem(
+                0, self._item("Quit", "Close the launcher",
+                              {"kind": "quit"})
+            )
+
         # inline math answer (no separate calc window)
         ok, result = try_eval_math(raw)
         if ok and self.list_widget.count() < MAX_SUGGESTIONS + 1:
@@ -799,6 +806,12 @@ class ModernLauncher(QWidget):
 
     def on_enter(self):
         raw = self.entry.text().strip()
+        # exact quit/exit always wins (a hint row must never swallow it)
+        if norm_key(raw) in ("quit", "exit"):
+            maps = self.config.get("mappings", {})
+            if norm_key(raw) not in maps:
+                self.quit_app()
+                return
         payload = self._selected_payload()
         if payload:
             self.dispatch(payload, raw)
@@ -843,6 +856,8 @@ class ModernLauncher(QWidget):
                                  payload.get("desc", ""))
         elif kind == "manage":
             self.entry.setText("keys")
+        elif kind == "quit":
+            self.quit_app()
         elif kind == "launch":
             self.execute_keyword(payload.get("key", raw))
         elif kind == "hint":
@@ -895,6 +910,12 @@ class ModernLauncher(QWidget):
 
     def copy_to_clipboard(self, text: str):
         QApplication.clipboard().setText(text)
+
+    def quit_app(self):
+        self.hide_popup()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def execute_keyword(self, keyword: str):
         keyword = norm_key(keyword)
@@ -975,8 +996,6 @@ class ModernLauncher(QWidget):
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
-
-        from PyQt6.QtWidgets import QComboBox
 
         top = QHBoxLayout()
         lang_box = QComboBox()

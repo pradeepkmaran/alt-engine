@@ -1,8 +1,0 @@
-{
-  "mappings": {
-    "timesheet": "https://example.com/timesheet",
-    "idea": "C:/Program Files/JetBrains/IntelliJ IDEA Community Edition/bin/idea64.exe"
-  }, 
-  "directories": {},
-  "websites": {}
-}
